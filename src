@@ -1,0 +1,355 @@
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
+#include <AL/al.h>
+#include <AL/alc.h>
+#include <iostream>
+#include <vector>
+
+// O'yin oynasi sozlamalari
+const int WIDTH = 1920;
+const int HEIGHT = 1080;
+const float ASPECT_RATIO = (float)WIDTH / HEIGHT;
+const float FPS = 60.0f;
+
+// Kamera sozlamalari
+glm::vec3 cameraPos = glm::vec3(1.0f, 1.0f, 2.0f);
+glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
+glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+float yaw = -90.0f, pitch = 0.0f;
+float lastX = WIDTH / 2.0f, lastY = HEIGHT / 2.0f;
+bool firstMouse = true;
+
+// O'yinchi pozitsiyasi va animatsiya
+glm::vec3 playerPos = cameraPos;
+float headRotation = 0.0f;
+
+// Rejimlar
+enum CameraMode { FIRST_PERSON, THIRD_PERSON_CLOSE, THIRD_PERSON_FAR };
+CameraMode cameraMode = FIRST_PERSON;
+
+// Labirint (20x20, murakkab)
+const int MAZE_SIZE = 20;
+int maze[MAZE_SIZE][MAZE_SIZE] = {
+    {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
+    {1,0,0,0,1,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1},
+    {1,0,1,0,1,0,1,1,0,1,0,1,0,1,0,1,1,1,0,1},
+    {1,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,0,1,0,1},
+    {1,0,1,1,1,1,0,1,1,1,0,1,1,1,1,0,1,1,0,1},
+    {1,0,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,0,0,1},
+    {1,1,1,1,0,1,1,1,0,1,1,1,0,1,0,1,1,1,0,1},
+    {1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,1,0,1},
+    {1,0,1,1,1,1,1,1,1,1,0,1,1,1,1,0,1,1,0,1},
+    {1,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1},
+    {1,1,1,1,1,1,1,1,0,1,1,1,0,1,0,1,1,1,0,1},
+    {1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,1,0,1},
+    {1,0,1,1,1,1,1,1,1,1,0,1,1,1,1,0,1,1,0,1},
+    {1,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1},
+    {1,1,1,1,0,1,1,1,0,1,1,1,0,1,0,1,1,1,0,1},
+    {1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,1,0,1},
+    {1,0,1,1,1,1,1,1,1,1,0,1,1,1,1,0,1,1,0,1},
+    {1,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1},
+    {1,0,1,1,1,1,1,1,0,1,1,1,0,1,0,1,1,1,0,1},
+    {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
+};
+
+// Shaderlar
+const char* vertexShaderSource = R"(
+    #version 330 core
+    layout (location = 0) in vec3 aPos;
+    layout (location = 1) in vec2 aTexCoord;
+    out vec2 TexCoord;
+    uniform mat4 model;
+    uniform mat4 view;
+    uniform mat4 projection;
+    void main() {
+        gl_Position = projection * view * model * vec4(aPos, 1.0);
+        TexCoord = aTexCoord;
+    }
+)";
+
+const char* fragmentShaderSource = R"(
+    #version 330 core
+    in vec2 TexCoord;
+    out vec4 FragColor;
+    uniform sampler2D texture1;
+    uniform vec3 lightColor;
+    void main() {
+        vec4 texColor = texture(texture1, TexCoord);
+        FragColor = texColor * vec4(lightColor, 1.0);
+    }
+)";
+
+// Tovush tizimi
+ALCdevice* device;
+ALCcontext* context;
+ALuint source, buffer;
+
+void initOpenAL() {
+    device = alcOpenDevice(NULL);
+    if (!device) {
+        std::cout << "OpenAL device ochilmadi!" << std::endl;
+        return;
+    }
+    context = alcCreateContext(device, NULL);
+    alcMakeContextCurrent(context);
+    alGenSources(1, &source);
+    alGenBuffers(1, &buffer);
+    // Soddalashtirilgan tovush (haqiqiy .wav fayl kerak)
+    // ALshort data[] = {...}; // O'rniga haqiqiy WAV fayl kerak
+    // alBufferData(buffer, AL_FORMAT_MONO16, data, sizeof(data), 44100);
+    alSourcei(source, AL_BUFFER, buffer);
+    alSourcePlay(source);
+}
+
+// Kamera boshqaruvi
+void processInput(GLFWwindow* window, float deltaTime) {
+    float speed = 2.5f * deltaTime;
+    glm::vec3 newPos = playerPos;
+
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+        newPos += speed * cameraFront;
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+        newPos -= speed * cameraFront;
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+        newPos -= glm::normalize(glm::cross(cameraFront, cameraUp)) * speed;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+        newPos += glm::normalize(glm::cross(cameraFront, cameraUp)) * speed;
+
+    // To'qnashuv tekshiruvi
+    int mazeX = (int)newPos.x;
+    int mazeZ = (int)newPos.z;
+    if (mazeX >= 0 && mazeX < MAZE_SIZE && mazeZ >= 0 && mazeZ < MAZE_SIZE && maze[mazeX][mazeZ] == 0) {
+        playerPos = newPos;
+    }
+
+    // Rejim o'zgartirish
+    if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) cameraMode = FIRST_PERSON;
+    if (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS) cameraMode = THIRD_PERSON_CLOSE;
+    if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) cameraMode = THIRD_PERSON_FAR;
+
+    // Bosh animatsiyasi (soddalashtirilgan)
+    headRotation = yaw;
+}
+
+// Sichqoncha boshqaruvi (sensor simulyatsiyasi)
+void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (firstMouse) {
+        lastX = xpos;
+        lastY = ypos;
+        firstMouse = false;
+    }
+
+    float xoffset = xpos - lastX;
+    float yoffset = lastY - ypos;
+    lastX = xpos;
+    lastY = ypos;
+
+    float sensitivity = 0.1f;
+    xoffset *= sensitivity;
+    yoffset *= sensitivity;
+
+    yaw += xoffset;
+    pitch += yoffset;
+
+    // Tepaga va pastga qarash cheklovi (labirint tepasidan ko'rish imkonsiz)
+    if (pitch > 45.0f) pitch = 45.0f;
+    if (pitch < -45.0f) pitch = -45.0f;
+
+    glm::vec3 front;
+    front.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
+    front.y = sin(glm::radians(pitch));
+    front.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
+    cameraFront = glm::normalize(front);
+}
+
+// Model yuklash (soddalashtirilgan)
+void loadModel() {
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile("assets/player_model.fbx", aiProcess_Triangulate | aiProcess_FlipUVs);
+    if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode) {
+        std::cout << "Model yuklashda xato: " << importer.GetErrorString() << std::endl;
+        return;
+    }
+    // Modelni qayta ishlash (haqiqiy .fbx fayl kerak)
+}
+
+// Tekstura yuklash (soddalashtirilgan)
+unsigned int loadTexture() {
+    unsigned int texture;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Haqiqiy tekstura fayli kerak (masalan, stb_image.h orqali)
+    return texture;
+}
+
+int main() {
+    // GLFW ni ishga tushirish
+    if (!glfwInit()) {
+        std::cout << "GLFW init failed!" << std::endl;
+        return -1;
+    }
+
+    GLFWwindow* window = glfwCreateWindow(WIDTH, HEIGHT, "3D Maze Game", NULL, NULL);
+    if (!window) {
+        glfwTerminate();
+        return -1;
+    }
+
+    glfwMakeContextCurrent(window);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glfwSetCursorPosCallback(window, mouse_callback);
+
+    // GLEW ni ishga tushirish
+    if (glewInit() != GLEW_OK) {
+        std::cout << "GLEW init failed!" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+
+    // OpenAL ni ishga tushirish
+    initOpenAL();
+
+    // Shaderlarni tayyorlash
+    unsigned int vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
+    glCompileShader(vertexShader);
+    int success;
+    char infoLog[512];
+    glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
+        std::cout << "Vertex shader xatosi: " << infoLog << std::endl;
+    }
+
+    unsigned int fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
+    glCompileShader(fragmentShader);
+    glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog);
+        std::cout << "Fragment shader xatosi: " << infoLog << std::endl;
+    }
+
+    unsigned int shaderProgram = glCreateProgram();
+    glAttachShader(shaderProgram, vertexShader);
+    glAttachShader(shaderProgram, fragmentShader);
+    glLinkProgram(shaderProgram);
+    glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
+        std::cout << "Shader dasturi xatosi: " << infoLog << std::endl;
+    }
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    // Kub geometriyasi (devorlar va o'yinchi uchun)
+    float vertices[] = {
+        // Pozitsiyalar        // Tekstura koordinatalari
+        -0.5f, -0.5f, -0.5f,  0.0f, 0.0f,
+         0.5f, -0.5f, -0.5f,  1.0f, 0.0f,
+         0.5f,  0.5f, -0.5f,  1.0f, 1.0f,
+         0.5f,  0.5f, -0.5f,  1.0f, 1.0f,
+        -0.5f,  0.5f, -0.5f,  0.0f, 1.0f,
+        -0.5f, -0.5f, -0.5f,  0.0f, 0.0f,
+        // Yana 5 ta yuz uchun vertexlar qo'shish kerak (soddalashtirilgan)
+    };
+
+    unsigned int VBO, VAO;
+    glGenVertexArrays(1, &VAO);
+    glGenBuffers(1, &VBO);
+    glBindVertexArray(VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glEnable(GL_DEPTH_TEST);
+
+    // Yorug'lik sozlamalari
+    glm::vec3 lightColor(1.0f, 1.0f, 1.0f); // Oq yorug'lik
+
+    // Tekstura
+    unsigned int texture = loadTexture();
+
+    // O'yin tsikli
+    float deltaTime = 0.0f, lastFrame = 0.0f;
+    while (!glfwWindowShouldClose(window)) {
+        float currentFrame = glfwGetTime();
+        deltaTime = currentFrame - lastFrame;
+        lastFrame = currentFrame;
+
+        // 60 FPS cheklovi
+        if (deltaTime < 1.0f / FPS) continue;
+
+        processInput(window, deltaTime);
+
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // Kamera rejimlari
+        glm::mat4 view;
+        if (cameraMode == FIRST_PERSON) {
+            view = glm::lookAt(playerPos, playerPos + cameraFront, cameraUp);
+        } else if (cameraMode == THIRD_PERSON_CLOSE) {
+            view = glm::lookAt(playerPos - cameraFront * 2.0f + glm::vec3(0.0f, 1.0f, 0.0f), playerPos, cameraUp);
+        } else {
+            view = glm::lookAt(playerPos - cameraFront * 5.0f + glm::vec3(0.0f, 2.0f, 0.0f), playerPos, cameraUp);
+        }
+
+        glm::mat4 projection = glm::perspective(glm::radians(45.0f), ASPECT_RATIO, 0.1f, 100.0f);
+
+        glUseProgram(shaderProgram);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniform3fv(glGetUniformLocation(shaderProgram, "lightColor"), 1, glm::value_ptr(lightColor));
+        glBindTexture(GL_TEXTURE_2D, texture);
+
+        // Labirintni chizish
+        for (int i = 0; i < MAZE_SIZE; i++) {
+            for (int j = 0; j < MAZE_SIZE; j++) {
+                if (maze[i][j] == 1) {
+                    glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(i, 0.0f, j));
+                    model = glm::scale(model, glm::vec3(1.0f, 2.0f, 1.0f));
+                    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
+                    glBindVertexArray(VAO);
+                    glDrawArrays(GL_TRIANGLES, 0, 6); // Faqat bitta yuz (soddalashtirilgan)
+                }
+            }
+        }
+
+        // O'yinchini chizish (soddalashtirilgan model)
+        glm::mat4 playerModel = glm::translate(glm::mat4(1.0f), playerPos);
+        playerModel = glm::rotate(playerModel, glm::radians(headRotation), glm::vec3(0.0f, 1.0f, 0.0f));
+        playerModel = glm::scale(playerModel, glm::vec3(0.5f, 1.0f, 0.5f));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(playerModel));
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    // Tozalash
+    alDeleteSources(1, &source);
+    alDeleteBuffers(1, &buffer);
+    alcDestroyContext(context);
+    alcCloseDevice(device);
+    glDeleteVertexArrays(1, &VAO);
+    glDeleteBuffers(1, &VBO);
+    glDeleteProgram(shaderProgram);
+    glDeleteTextures(1, &texture);
+    glfwTerminate();
+    return 0;
+}
